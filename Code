@@ -1,0 +1,156 @@
+#!/bin/bash
+set -uo pipefail
+
+############################################################
+# AlphaFold3 RIXI–Xylanase Pipeline
+# - Generates pair JSON files
+# - Runs AF3 (1 seed per sequence)
+# - Extracts ipTM scores
+############################################################
+
+# ====== USER SETTINGS (EDIT THESE) ======
+BASE="/mnt/ffs24/home/decast16/boltz"
+XYL_FASTA_DIR="$BASE/af2_split"
+JSON_DIR="$BASE/af3_rixi_json"
+OUT_DIR="$BASE/af3_rixi_outputs"
+MODEL_DIR="/mnt/research/CHE_882_Spring2026_001/af3_weights"
+
+# RIXI sequence
+RIXI_SEQ="AGKTGQMTVFWGRNKNEGTLKETCDTGLYTTVVISFYSVFGHGRYWGDLSGHDLRVIGADIKHCQSKNIFVFLSIGGAGKDYSLPTSKSAADVADNIWNAHMDGRRPGVFRPFGDAAVDGIDFFIDQGAPDHYDDLARNLYAYNKMYRARTPVRLTATVRCAFPDPRMKKALDTKLFERIHVRFYDDATCSYNHAGLAGVMAQWNKWTARYPGSHVYLGLAAANVPGKNDNVFIKQLYYDLLPNVQKAKNYGGIMLWDRFYDKQTGYGKTVKYWA"
+
+############################################################
+# STEP 1: LOAD ALPHAFOLD3
+############################################################
+
+module purge
+module load AlphaFold3/3.0.1-foss-2023a-CUDA-12.4.0
+
+export XLA_FLAGS="--xla_disable_hlo_passes=custom-kernel-fusion-rewriter"
+export XLA_PYTHON_CLIENT_PREALLOCATE="true"
+export XLA_CLIENT_MEM_FRACTION="0.95"
+
+############################################################
+# STEP 2: CREATE JSON INPUT FILES
+############################################################
+
+mkdir -p "$JSON_DIR"
+
+echo "Generating AF3 pair JSON files..."
+
+for fasta in "$XYL_FASTA_DIR"/seq*.fasta; do
+    [ -e "$fasta" ] || continue
+
+    name=$(basename "$fasta" .fasta)
+
+    # Extract xylanase sequence
+    seq=$(grep -v '^>' "$fasta" | tr -d '\n\r')
+
+    json_file="$JSON_DIR/${name}_rixi.json"
+
+    cat > "$json_file" <<EOF
+{
+  "name": "${name}_rixi",
+  "sequences": [
+    {
+      "protein": {
+        "id": "A",
+        "sequence": "$seq"
+      }
+    },
+    {
+      "protein": {
+        "id": "B",
+        "sequence": "$RIXI_SEQ"
+      }
+    }
+  ],
+  "modelSeeds": [1],
+  "dialect": "alphafold3",
+  "version": 1
+}
+EOF
+
+done
+
+echo "JSON generation complete."
+
+############################################################
+# STEP 3: RUN ALPHAFOLD3
+############################################################
+
+mkdir -p "$OUT_DIR"
+
+echo "Starting AF3 runs..."
+
+for json in "$JSON_DIR"/seq*_rixi.json; do
+
+    name=$(basename "$json" .json)
+    out="$OUT_DIR/$name"
+
+    echo "======================================"
+    echo "Processing $name"
+    echo "======================================"
+
+    mkdir -p "$out"
+
+    # Skip if already completed
+    if find "$out" -name "summary_confidences.json" -print -quit | grep -q .; then
+        echo "$name already complete → skipping"
+        continue
+    fi
+
+    python "$EBROOTALPHAFOLD3/bin/run_alphafold.py" \
+        --json_path="$json" \
+        --db_dir="$AF3_DB_DIR" \
+        --model_dir="$MODEL_DIR" \
+        --output_dir="$out" \
+        --flash_attention_implementation=xla
+
+    status=$?
+
+    if [ $status -ne 0 ]; then
+        echo "$name FAILED"
+        continue
+    fi
+
+    echo "$name completed"
+
+done
+
+############################################################
+# STEP 4: EXTRACT ipTM SCORES
+############################################################
+
+echo "Extracting ipTM scores..."
+
+OUTPUT_CSV="$BASE/af3_iptm_scores.csv"
+
+echo "sequence,iptm" > "$OUTPUT_CSV"
+
+for dir in "$OUT_DIR"/seq*_rixi; do
+
+    name=$(basename "$dir")
+
+    file=$(find "$dir" -name "*summary_confidences.json" | head -n 1)
+
+    if [ -z "$file" ]; then
+        echo "$name,FAILED" >> "$OUTPUT_CSV"
+        continue
+    fi
+
+    iptm=$(python - <<PY
+import json
+print(json.load(open("$file")).get("iptm",""))
+PY
+)
+
+    echo "$name,$iptm" >> "$OUTPUT_CSV"
+
+done
+
+echo "Done. Results saved to:"
+echo "$OUTPUT_CSV"
+
+############################################################
+# END
+############################################################
