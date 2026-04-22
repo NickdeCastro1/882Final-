@@ -6,6 +6,7 @@ set -uo pipefail
 # - Generates pair JSON files
 # - Runs AF3 (1 seed per sequence)
 # - Extracts ipTM scores
+# - Note: Before running, install all dependencies 
 ############################################################
 
 # ====== USER SETTINGS (EDIT THESE) ======
